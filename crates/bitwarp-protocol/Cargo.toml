@@ -1,0 +1,25 @@
+[package]
+name = "bitwarp-protocol"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+
+[lib]
+doctest = false
+
+[dependencies]
+bitwarp-core.workspace = true
+byteorder.workspace = true
+rand.workspace = true
+crc32fast.workspace = true
+flate2.workspace = true
+lz4.workspace = true
+
+[dev-dependencies]
+quickcheck.workspace = true
+quickcheck_macros.workspace = true
+
+[lints]
+workspace = true
+

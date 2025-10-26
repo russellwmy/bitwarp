@@ -1,0 +1,17 @@
+[package]
+name = "bitwarp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+
+[lib]
+doctest = false
+
+[dependencies]
+bitwarp-core.workspace = true
+bitwarp-protocol.workspace = true
+bitwarp-host.workspace = true
+
+[lints]
+workspace = true

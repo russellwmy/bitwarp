@@ -1,0 +1,17 @@
+# Set the line width
+# https://rust-lang.github.io/rustfmt/?version=master&search=#use_small_heuristics
+use_small_heuristics = "Max"
+
+# Re-order imports
+# https://rust-lang.github.io/rustfmt/?version=master&search=#reorder_imports
+reorder_imports = true
+
+# Parser edition
+# https://rust-lang.github.io/rustfmt/?version=master&search=#edition
+edition = "2021"
+
+# These options are only available in +nightly.
+unstable_features = true
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"
+overflow_delimited_expr = true

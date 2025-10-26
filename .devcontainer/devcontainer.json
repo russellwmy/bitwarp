@@ -1,0 +1,21 @@
+{
+    "name": "bitwap-dev",
+    "image": "mcr.microsoft.com/devcontainers/rust:1-trixie",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "github.vscode-pull-request-github",
+                "eamodio.gitlens",
+                "Gruntfuggly.todo-tree",
+                "vscode-icons-team.vscode-icons",
+                "IBM.output-colorizer",
+                "ms-azuretools.vscode-docker",
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml",
+                "DavidAnson.vscode-markdownlint",
+                "fill-labs.dependi"
+            ]
+        }
+    },
+    "postCreateCommand": ".devcontainer/startup.sh"
+}

@@ -1,0 +1,96 @@
+[workspace.package]
+authors = ["Russell Wong"]
+edition = "2021"
+rust-version = "1.86.0"
+homepage = "https://github.com/russellwmy/bitwarp"
+repository = "https://github.com/russellwmy/bitwarp"
+license = "MIT"
+
+[workspace.metadata.workspaces]
+version = "0.20.1"
+exclude = []
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/bitwarp-core",
+    "crates/bitwarp-protocol",
+    "crates/bitwarp-peer",
+    "crates/bitwarp-host",
+    "crates/bitwarp-utilities",
+    "crates/bitwarp",
+]
+exclude = []
+
+[workspace.lints.clippy]
+all = { level = "allow", priority = -100 }
+correctness = { level = "deny", priority = -50 }
+suspicious = { level = "deny", priority = -50 }
+perf = { level = "deny", priority = -50 }
+# overrides clippy::perf = "deny": https://github.com/rust-lang/rust-clippy/issues/8111
+single_char_pattern = "allow"
+clone_on_copy = "deny"
+derivable_impls = "deny"
+redundant_clone = "deny"
+len_zero = "deny"
+or_fun_call = "deny"
+unnecessary_lazy_evaluations = "deny"
+
+[workspace.lints.rust]
+# Will take effect since Rust 1.80, produces unused warning before it: https://github.com/rust-lang/cargo/pull/13913
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(enable_const_type_id)'] }
+
+
+[profile.dev]
+panic = 'abort'
+
+[profile.release]
+overflow-checks = true
+panic = 'abort'
+lto = "fat"
+codegen-units = 1
+
+# A much faster to compile version of `release`, for development use.
+[profile.dev-release]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug-assertions = true
+
+# Used for fuzzing, LTO is ill-supported as of 2023-09 and so should not be enabled.
+[profile.fuzz]
+inherits = "dev"
+opt-level = 3
+incremental = false
+codegen-units = 1
+
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
+
+[profile.server-dev]
+inherits = "dev"
+
+[profile.android-dev]
+inherits = "dev"
+
+[workspace.dependencies]
+# Internal workspace crates
+bitwarp-core = { path = "crates/bitwarp-core" }
+bitwarp-protocol = { path = "crates/bitwarp-protocol" }
+bitwarp-peer = { path = "crates/bitwarp-peer" }
+bitwarp-host = { path = "crates/bitwarp-host" }
+bitwarp-utilities = { path = "crates/bitwarp-utilities" }
+
+# External dependencies
+byteorder = "1.5.0"
+rand = "0.9.2"
+crc32fast = "1.5.0"
+flate2 = "1.1.5"
+lz4 = "1.28.1"
+tracing = "0.1.41"
+crossbeam-channel = "0.5.15"
+socket2 = "0.6.1"
+dns-lookup = "3.0.1"
+quickcheck = "1.0.3"
+quickcheck_macros = "1.1.0"
