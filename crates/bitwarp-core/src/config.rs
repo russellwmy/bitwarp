@@ -149,7 +149,7 @@ impl Default for Config {
             socket_send_buffer_size: None,  // Use system default
             socket_ttl: None,  // Use system default
             socket_broadcast: false,  // Disabled by default
-            use_pmtu_discovery: false,
+            use_pmtu_discovery: true,
             pmtu_min: 576,
             pmtu_max: 1400,
             pmtu_interval_ms: 5000,

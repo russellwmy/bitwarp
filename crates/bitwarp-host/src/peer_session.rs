@@ -136,34 +136,68 @@ impl Session for Peer {
 
                 match ordering {
                     OrderingGuarantee::Unsequenced => {
-                        // Unsequenced: prevents duplicates without ordering
-                        let unsequenced_group = self.next_unsequenced_group();
-                        self.enqueue_command(bitwarp_protocol::command::ProtocolCommand::SendUnsequenced {
-                            channel_id,
-                            unsequenced_group,
-                            data: event.payload_arc().into(),
-                        });
+                        // Unsequenced: prevents duplicates without ordering.
+                        // Chunk into multiple unsequenced commands if needed to fit MTU budget.
+                        let datagram_cap = std::cmp::min(
+                            self.current_fragment_size() as usize,
+                            self.config().receive_buffer_max_size,
+                        );
+                        let compression_overhead = match self.config().compression {
+                            bitwarp_core::config::CompressionAlgorithm::Lz4 => 5,
+                            _ => 1,
+                        };
+                        let checksum_overhead = if self.config().use_checksums { 4 } else { 0 };
+                        let per_packet_overhead =
+                            1 /* command count */ + compression_overhead + checksum_overhead;
+                        let send_unsequenced_header =
+                            1 /* type */ + 1 /* channel */ + 2 /* unseq group */ + 2 /* len */; // = 6
+                        let max_payload_unseq = std::cmp::max(
+                            1,
+                            datagram_cap
+                                .saturating_sub(per_packet_overhead)
+                                .saturating_sub(2 /* len prefix */)
+                                .saturating_sub(send_unsequenced_header),
+                        );
+
+                        let base = bitwarp_core::shared::SharedBytes::from_arc(event.payload_arc());
+                        let mut offset = 0usize;
+                        while offset < base.len() {
+                            let len = std::cmp::min(max_payload_unseq, base.len() - offset);
+                            let chunk = base.slice(offset, len);
+                            let unsequenced_group = self.next_unsequenced_group();
+                            self.enqueue_command(bitwarp_protocol::command::ProtocolCommand::SendUnsequenced {
+                                channel_id,
+                                unsequenced_group,
+                                data: chunk,
+                            });
+                            offset += len;
+                        }
                     }
                     _ => {
-                        // Regular unreliable (no sequencing or ordering)
-                        self.enqueue_command(bitwarp_protocol::command::ProtocolCommand::SendUnreliable {
-                            channel_id,
-                            data: event.payload_arc().into(),
-                        });
+                        // Regular unreliable (no sequencing or ordering); allow fragmentation
+                        self.enqueue_unreliable_data(channel_id, event.payload_arc());
                     }
                 }
             }
         }
 
-        // Flush commands immediately if within bandwidth
-        if self.can_send_within_bandwidth() {
-            match self.encode_queued_commands() {
-                Ok(bytes) => {
+        // Flush commands immediately if within bandwidth, splitting into MTU-sized datagrams
+        while self.has_queued_commands() && self.can_send_within_bandwidth() {
+            let cap = std::cmp::min(
+                self.current_fragment_size() as usize,
+                self.config().receive_buffer_max_size,
+            );
+            match self.encode_queued_commands_bounded(cap) {
+                Ok(Some(bytes)) => {
                     // Track bytes for bandwidth throttling
                     self.record_bytes_sent(bytes.len() as u32);
                     actions.push(Action::Send(bytes));
                 }
-                Err(e) => error!("Error encoding queued commands: {:?}", e),
+                Ok(None) => break,
+                Err(e) => {
+                    error!("Error encoding queued commands: {:?}", e);
+                    break;
+                }
             }
         }
         // If over bandwidth limit, keep commands queued for next window
@@ -190,15 +224,23 @@ impl Session for Peer {
             }
         }
 
-        // Flush any queued commands (ACKs, Pongs, Pings, etc.) if within bandwidth
-        if self.has_queued_commands() && self.can_send_within_bandwidth() {
-            match self.encode_queued_commands() {
-                Ok(bytes) => {
-                    // Track bytes for bandwidth throttling
+        // Flush any queued commands (ACKs, Pongs, Pings, etc.) if within bandwidth,
+        // splitting into MTU-sized datagrams
+        while self.has_queued_commands() && self.can_send_within_bandwidth() {
+            let cap = std::cmp::min(
+                self.current_fragment_size() as usize,
+                self.config().receive_buffer_max_size,
+            );
+            match self.encode_queued_commands_bounded(cap) {
+                Ok(Some(bytes)) => {
                     self.record_bytes_sent(bytes.len() as u32);
                     actions.push(Action::Send(bytes));
                 }
-                Err(e) => error!("Error encoding queued commands: {:?}", e),
+                Ok(None) => break,
+                Err(e) => {
+                    error!("Error encoding queued commands: {:?}", e);
+                    break;
+                }
             }
         }
 

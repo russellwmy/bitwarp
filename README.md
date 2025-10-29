@@ -1,412 +1,248 @@
 # Bitwarp
 
-A high-performance, [ENet](http://enet.bespin.org/) inspired reliable UDP networking library for Rust, designed for games and real-time applications.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/rust-1.86%2B-orange.svg)](https://www.rust-lang.org/)
 
-## Overview
+A modern, high-performance reliable UDP networking library for Rust, inspired by [ENet](http://enet.bespin.org/).
 
-Bitwarp provides a modular networking stack with configurable reliability, ordering guarantees, and advanced features like multi-channel communication and bandwidth throttling. The architecture separates protocol logic from I/O, making it testable and flexible.
-
-## Architecture
-
-```
-bitwarp (facade)
-    ├── bitwarp-host      - Host/session manager, UDP socket, events
-    ├── bitwarp-peer      - Peer state machine, command batching
-    ├── bitwarp-protocol  - Commands, packets, fragmentation, ACK, congestion
-    └── bitwarp-core      - Config, errors, constants, transport trait
-```
-
-### Crates
-
-- **`bitwarp`** - Convenient public API facade
-- **`bitwarp-core`** - Foundation: config, errors, transport abstraction
-- **`bitwarp-protocol`** - Protocol implementation: commands, packets, fragmentation, reliability
-- **`bitwarp-peer`** - Peer lifecycle management with command queue batching
-- **`bitwarp-host`** - High-level host managing multiple peer sessions over UDP
-
-## Design Principles
-
-### Separation of Concerns
-
-- **Protocol layer** - Pure logic, no I/O, fully testable
-- **Peer layer** - State machine for connection lifecycle
-- **Host layer** - I/O management, socket operations, event dispatch
-
-### ENet-Inspired
-
-- Command-based protocol (everything is a command: ACK, Ping, Send, etc.)
-- Command batching reduces UDP overhead
-- Adaptive RTT-based congestion control
-- Proper connection lifecycle with state machine
-
-### Type Safety
-
-- Strong typing prevents misuse
-- Builder patterns for complex configurations
-- Zero-cost abstractions where possible
+Bitwarp provides flexible delivery guarantees, automatic fragmentation, congestion control, and multi-channel communication—ideal for games and real-time applications.
 
 ## Features
 
-### Reliability & Ordering
-
-- **Reliable** - Guaranteed delivery with automatic retransmission
-- **Unreliable** - Fire-and-forget for low-latency data
-- **Ordered** - Packets delivered in send order
-- **Sequenced** - Only latest packet delivered, old ones dropped
-- **Unsequenced** - Prevents duplicates without requiring ordering (ENet-style)
-
-### Advanced Features
-
-- **Multi-channel** - Up to 255 independent channels per peer for traffic prioritization
-- **Bandwidth throttling** - Per-peer outgoing/incoming bandwidth limits (opt-in)
-- **Fragmentation** - Automatic splitting and reassembly of large packets
+- **Multiple delivery modes** - Reliable, unreliable, ordered, sequenced, and unsequenced
+- **Multi-channel support** - Up to 255 independent channels per connection
+- **Automatic fragmentation** - Handles large packets transparently with timeout-based cleanup
+- **PMTU discovery** - Adaptive MTU detection (enabled by default)
 - **Congestion control** - RTT-based adaptive throttling
-- **Graceful disconnect** - Proper connection lifecycle with PeerState machine
-- **Compression** - Optional Zlib or LZ4 compression (opt-in, backward compatible)
-- **CRC32 checksums** - Optional data integrity verification (opt-in, backward compatible)
-
-### Performance
-
-- **Zero-copy** where possible
-- **Command batching** - Multiple operations aggregated into single UDP packets
-- **Efficient ACKs** - Bitfield acknowledgments covering 32 packets
-- **Send buffer pooling** - Host recycles send buffers to reduce allocations in hot paths
+- **Bandwidth limiting** - Per-peer bandwidth throttling (optional)
+- **Compression** - Optional LZ4 or Zlib compression
+- **Data integrity** - Optional CRC32 checksums
+- **Zero-copy design** - Efficient buffer management with Arc-based sharing
+- **Command batching** - Multiple operations packed into single UDP packets
 
 ## Quick Start
 
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+bitwarp = "0.1"
+```
+
+### Basic Example
+
 ```rust
 use bitwarp::{Host, Packet, SocketEvent};
+use std::time::Instant;
 
-// Create host
-let mut host = Host::bind_any()?;
-let server_addr = host.local_addr()?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a host
+    let mut host = Host::bind("127.0.0.1:9000")?;
 
-// Send reliable packet on channel 0
-host.send(Packet::reliable_unordered(server_addr, b"hello".to_vec()))?;
+    // Connect to a peer or send data
+    let peer_addr = "127.0.0.1:8000".parse()?;
+    host.send(Packet::reliable_unordered(peer_addr, b"Hello".to_vec()))?;
 
-// Poll for events
-host.manual_poll(std::time::Instant::now());
+    // Poll for events
+    loop {
+        host.manual_poll(Instant::now());
 
-while let Some(event) = host.recv() {
-    match event {
-        SocketEvent::Connect(addr) => {
-            println!("Peer connected: {}", addr);
-        }
-        SocketEvent::Packet(pkt) => {
-            println!("Received on channel {}: {:?}", pkt.channel_id(), pkt.payload());
-        }
-        SocketEvent::Disconnect(addr) => {
-            println!("Peer disconnected: {}", addr);
-        }
-        SocketEvent::Timeout(addr) => {
-            println!("Peer timeout: {}", addr);
+        while let Some(event) = host.recv() {
+            match event {
+                SocketEvent::Connect(addr) => {
+                    println!("Peer connected: {}", addr);
+                }
+                SocketEvent::Packet(packet) => {
+                    println!("Received {} bytes on channel {}",
+                        packet.payload().len(),
+                        packet.channel_id());
+                }
+                SocketEvent::Disconnect(addr) => {
+                    println!("Peer disconnected: {}", addr);
+                }
+                SocketEvent::Timeout(addr) => {
+                    println!("Peer timeout: {}", addr);
+                }
+            }
         }
     }
 }
-# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-## Examples
+## Delivery Guarantees
 
-Runnable examples are included under the `bitwarp` crate:
+```rust
+use bitwarp::Packet;
 
-- Echo server: `cargo run -p bitwarp --example server -- 127.0.0.1:7777`
-- Client: `cargo run -p bitwarp --example client -- 127.0.0.1:7777`
+// Unreliable (fire-and-forget, lowest latency)
+let pkt = Packet::unreliable(addr, data);
 
-Paths:
+// Reliable (guaranteed delivery, unordered)
+let pkt = Packet::reliable_unordered(addr, data);
 
-- `crates/bitwarp/examples/server.rs`
-- `crates/bitwarp/examples/client.rs`
+// Reliable + Ordered (TCP-like)
+let pkt = Packet::reliable_ordered(addr, data, None);
 
-Tip: omit the address to use defaults (`127.0.0.1:9000`).
+// Sequenced (only latest packet delivered)
+let pkt = Packet::reliable_sequenced(addr, data, None);
+
+// Unsequenced (prevents duplicates, allows reordering)
+let pkt = Packet::unsequenced(addr, data);
+```
 
 ## Multi-Channel Communication
 
-Channels allow prioritizing different types of traffic independently:
+Use channels to prioritize different traffic types independently:
 
 ```rust
-// Send high-priority command on channel 0
-host.send(Packet::reliable_on_channel(addr, player_input, 0))?;
+use bitwarp::{Config, Host};
 
-// Send low-priority state sync on channel 1
-host.send(Packet::unreliable_on_channel(addr, world_state, 1))?;
-
-// Send bulk data on channel 2
-host.send(Packet::reliable_on_channel(addr, asset_data, 2))?;
-```
-
-Configure channel count (default: 1):
-
-```rust
-use bitwarp::Config;
-
+// Configure channel count
 let mut config = Config::default();
-config.channel_count = 8;  // Support 8 channels per peer
+config.channel_count = 4;
+let mut host = Host::bind_with_config("0.0.0.0:7777", config)?;
 
-let host = Host::bind_with_config("0.0.0.0:7777", config)?;
-```
-
-## Bandwidth Throttling
-
-Limit bandwidth per peer (opt-in, backward compatible):
-
-```rust
-let mut config = Config::default();
-config.outgoing_bandwidth_limit = 100_000;  // 100 KB/sec (0 = unlimited)
-config.incoming_bandwidth_limit = 200_000;  // 200 KB/sec (0 = unlimited)
-
-let host = Host::bind_with_config(addr, config)?;
-```
-
-When the limit is reached:
-
-- Outgoing: packets are queued and sent in the next 1-second window.
-- Incoming: excess packets are dropped for the remainder of the window.
-
-Default is `0` (unlimited) for backward compatibility.
-
-Adjust limits at runtime from the peer using a control command:
-
-```rust
-use bitwarp_protocol::command::ProtocolCommand;
-
-// Apply new limits immediately on the remote
-peer.enqueue_command(ProtocolCommand::BandwidthLimit { incoming: 200_000, outgoing: 100_000 });
-```
-
-## Compression
-
-Enable optional packet compression (opt-in, backward compatible):
-
-```rust
-use bitwarp::{Config, CompressionAlgorithm};
-
-let mut config = Config::default();
-config.compression = CompressionAlgorithm::Lz4;  // or Zlib, or None (default)
-config.compression_threshold = 128;  // Don't compress packets smaller than 128 bytes
-
-let host = Host::bind_with_config(addr, config)?;
-```
-
-**Supported algorithms:**
-
-- **None** - No compression (default, zero overhead)
-- **Zlib** - Balanced speed and compression ratio
-- **LZ4** - Fast compression, lower ratio, ideal for real-time
-
-Compression is applied before checksums. Small packets (below threshold) are not compressed. If compression doesn't reduce size, the packet is sent uncompressed automatically.
-
-**Use cases:**
-
-- Large text-based payloads (JSON, XML)
-- Repetitive data (player positions, state updates)
-- Bandwidth-constrained environments
-
-## CRC32 Checksums
-
-Enable optional data integrity verification (opt-in, backward compatible):
-
-```rust
-let mut config = Config::default();
-config.use_checksums = true;  // Enable CRC32 checksums (default: false)
-
-let host = Host::bind_with_config(addr, config)?;
-```
-
-When enabled, a 4-byte CRC32 checksum is appended to every packet and validated on receipt. Corrupted packets are automatically rejected. Default is `false` for backward compatibility and minimal overhead.
-
-**Use cases:**
-
-- Unreliable networks (WiFi, cellular)
-- Safety-critical applications
-- Detecting hardware errors or memory corruption
-
-## Handshake + PMTU Discovery
-
-Bitwarp performs a 3‑way connection handshake carrying session IDs and MTU negotiation.
-
-### Static Fragmentation (Default)
-
-By default, fragmentation uses the static `Config.fragment_size` value (1200 bytes):
-
-```rust
-let mut config = Config::default();
-config.fragment_size = 1200; // Safe default for most networks
-let host = Host::bind_with_config(addr, config)?;
-```
-
-### Dynamic PMTU Discovery (Optional)
-
-Enable automatic path MTU discovery to optimize fragment sizes per peer:
-
-```rust
-let mut config = Config::default();
-config.use_pmtu_discovery = true;  // Enable PMTU discovery
-config.pmtu_min = 576;              // Minimum probe size (default)
-config.pmtu_max = 1400;             // Maximum probe size (default)
-config.pmtu_interval_ms = 5000;    // Probe interval: 5 seconds (default)
-config.pmtu_converge_threshold = 64; // Convergence threshold (default)
-
-let host = Host::bind_with_config(addr, config)?;
-```
-
-**How it works:**
-
-- Binary search algorithm probes between `pmtu_min` and `pmtu_max`
-- Sends `PMTUProbe` commands at configured intervals
-- Peer responds with `PMTUReply` for successful probes
-- Updates per-peer `fragment_size` based on successful probes
-- Handles timeouts by reducing upper bound
-- Converges when search range is below threshold
-
-**Benefits:**
-
-- Optimizes bandwidth usage by finding largest usable MTU
-- Adapts to network conditions automatically
-- Per-peer tuning for heterogeneous networks
-
-**Trade-offs:**
-
-- Adds periodic probe overhead (minimal, configurable)
-- Disabled by default for simplicity and backward compatibility
-
-## Disconnect Handling
-
-```rust
-// Graceful disconnect
-host.disconnect(peer_addr)?;
-
-// Or detect disconnection via events
-match host.recv() {
-    Some(SocketEvent::Disconnect(addr)) => {
-        // Peer gracefully disconnected
-    }
-    Some(SocketEvent::Timeout(addr)) => {
-        // Peer timed out (idle_connection_timeout exceeded)
-    }
-    _ => {}
-}
+// Send on different channels
+host.send(Packet::reliable_on_channel(addr, player_input, 0))?;  // High priority
+host.send(Packet::unreliable_on_channel(addr, world_state, 1))?; // State sync
+host.send(Packet::reliable_on_channel(addr, chat_message, 2))?;  // Chat
 ```
 
 ## Configuration
 
 ```rust
+use bitwarp::{Config, CompressionAlgorithm};
 use std::time::Duration;
-use bitwarp::Config;
 
 let mut config = Config::default();
 
-// Connection timeouts
-config.idle_connection_timeout = Duration::from_secs(10);
-config.heartbeat_interval = Some(Duration::from_secs(1));
+// Connection settings
+config.idle_connection_timeout = Duration::from_secs(30);
+config.heartbeat_interval = Some(Duration::from_secs(5));
 
-// Fragmentation
-config.max_packet_size = 32 * 1024;      // 32 KB max
-config.fragment_size = 1200;             // 1200 bytes per fragment
-config.max_fragments = 255;
+// Channels
+config.channel_count = 8;
 
-// Reliability
-config.max_packets_in_flight = 512;
-config.rtt_smoothing_factor = 0.1;
+// Fragmentation (PMTU discovery enabled by default)
+config.max_packet_size = 32 * 1024;  // 32 KB
+config.use_pmtu_discovery = true;    // Adaptive MTU (default: true)
+config.pmtu_min = 576;                // Minimum MTU
+config.pmtu_max = 1400;               // Maximum MTU
 
-// Channels & Bandwidth
-config.channel_count = 4;                     // 4 channels per peer
-config.outgoing_bandwidth_limit = 50_000;     // 50 KB/sec
-config.incoming_bandwidth_limit = 100_000;    // 100 KB/sec
+// Bandwidth limiting (0 = unlimited)
+config.outgoing_bandwidth_limit = 0;
+config.incoming_bandwidth_limit = 0;
 
-// Compression & Data Integrity
-config.compression = CompressionAlgorithm::Lz4;  // Lz4, Zlib, or None (default)
-config.compression_threshold = 128;              // Minimum size to compress (default: 128)
-config.use_checksums = true;                     // Enable CRC32 checksums (default: false)
+// Compression (optional)
+config.compression = CompressionAlgorithm::None;  // None, Lz4, or Zlib
+config.compression_threshold = 128;
+
+// Checksums (optional)
+config.use_checksums = false;
 
 let host = Host::bind_with_config("0.0.0.0:7777", config)?;
 ```
 
-## Packet Types
+## Examples
 
-```rust
-// Unreliable (fire-and-forget)
-let pkt = Packet::unreliable(addr, data);
-let pkt = Packet::unreliable_on_channel(addr, data, channel);
+Run the included examples:
 
-// Unsequenced (prevents duplicates, allows out-of-order)
-let pkt = Packet::unsequenced(addr, data);
+```bash
+# Server
+cargo run --example server -- 127.0.0.1:7777
 
-// Reliable (guaranteed delivery)
-let pkt = Packet::reliable_unordered(addr, data);
-let pkt = Packet::reliable_on_channel(addr, data, channel);
-
-// Reliable + Ordered (TCP-like)
-let pkt = Packet::reliable_ordered(addr, data, None);
-
-// Reliable + Sequenced (latest only)
-let pkt = Packet::reliable_sequenced(addr, data, None);
+# Client
+cargo run --example client -- 127.0.0.1:7777
 ```
 
-## Event Loop Patterns
+## Event Loop Integration
 
-### Manual Polling (Full Control)
+### Manual Polling (Game Loop)
 
 ```rust
+use std::{thread, time::{Duration, Instant}};
+
 let mut host = Host::bind_any()?;
 
 loop {
     host.manual_poll(Instant::now());
 
+    // Process events
     while let Some(event) = host.recv() {
         // Handle event
     }
 
-    // Your game/app logic here
-    thread::sleep(Duration::from_millis(16));
+    // Your game logic here
+
+    thread::sleep(Duration::from_millis(16));  // 60 FPS
 }
 ```
 
-### Automatic Polling (Dedicated Thread)
+### Automatic Polling (Background Thread)
 
 ```rust
+use std::thread;
+
 let mut host = Host::bind_any()?;
 let event_rx = host.get_event_receiver();
-let packet_tx = host.get_packet_sender();
 
-// Spawn polling thread
+// Start background polling
 thread::spawn(move || {
     host.start_polling();  // Polls every 1ms
 });
 
 // Main thread handles events
 for event in event_rx.iter() {
-    match event {
-        SocketEvent::Packet(pkt) => { /* ... */ }
-        _ => {}
-    }
+    // Handle event
+}
+```
+
+## Architecture
+
+Bitwarp is organized into several focused crates:
+
+```text
+bitwarp (public API)
+    ├── bitwarp-host      - Socket I/O and session management
+    ├── bitwarp-peer      - Per-peer state and command batching
+    ├── bitwarp-protocol  - Protocol logic, ACKs, fragmentation, congestion
+    └── bitwarp-core      - Configuration and shared types
+```
+
+The protocol layer is purely functional (no I/O), making it easy to test and reason about.
+
+## Best Practices
+
+1. **Use unreliable packets** for high-frequency position updates
+2. **Use reliable ordered** for critical game events
+3. **Use channels** to separate different traffic types
+4. **Enable PMTU discovery** for optimal bandwidth (default)
+5. **Poll regularly** - call `manual_poll()` at least once per frame
+6. **Clean up fragments** - call `cleanup_stale_fragments()` periodically in long-running apps
+
+```rust
+// In your main loop (recommended once per second)
+let now = Instant::now();
+for (_addr, peer) in host.peers_mut() {
+    peer.cleanup_stale_fragments(now);
 }
 ```
 
 ## Testing
 
 ```bash
-# Run all tests
-cargo test
-
-# Run with output
-cargo test -- --nocapture
-
-# Run specific test
-cargo test test_bandwidth_throttling
-
-# Check code
-cargo clippy
-cargo fmt --check
+cargo test --all                    # Run all tests
+cargo clippy --all-targets          # Check for issues
+cargo fmt --check                   # Check formatting
 ```
 
-## Performance Tips
+## Contributing
 
-1. **Use unreliable packets** for high-frequency updates (player positions, etc.)
-2. **Batch small messages** - protocol automatically batches commands
-3. **Adjust fragment size** for your network's MTU (default: 1200 bytes)
-4. **Use channels** to prioritize critical vs. bulk traffic
-5. **Monitor bandwidth** with `peer.bandwidth_utilization()`
+Contributions are welcome! Please ensure:
+
+- All tests pass: `cargo test --all`
+- Code is formatted: `cargo fmt`
+- No clippy warnings: `cargo clippy --all-targets`
 
 ## License
 

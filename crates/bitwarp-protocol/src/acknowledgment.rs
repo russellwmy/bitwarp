@@ -162,6 +162,9 @@ impl AcknowledgmentHandler {
 
     /// Returns packets that are considered dropped (not ACKed beyond window).
     /// Records packet loss for congestion control.
+    ///
+    /// A packet is considered dropped if it is more than REDUNDANT_PACKET_ACKS_SIZE (32)
+    /// sequence numbers behind the latest acknowledged sequence number.
     pub fn dropped_packets(&mut self) -> Vec<SentPacket> {
         let mut sent_sequences: Vec<SequenceNumber> = self.sent_packets.keys().cloned().collect();
         sent_sequences.sort_unstable();
@@ -170,11 +173,14 @@ impl AcknowledgmentHandler {
         let dropped: Vec<SentPacket> = sent_sequences
             .iter()
             .filter(|s| {
-                if sequence_greater_than(**s, remote_ack_sequence) {
-                    remote_ack_sequence.wrapping_sub(**s) > REDUNDANT_PACKET_ACKS_SIZE
-                } else if sequence_less_than(**s, remote_ack_sequence) {
-                    remote_ack_sequence.wrapping_sub(**s) > REDUNDANT_PACKET_ACKS_SIZE
+                // Only consider packets that are BEHIND the ACK sequence
+                if sequence_less_than(**s, remote_ack_sequence) {
+                    // Calculate how far behind this packet is
+                    let distance = remote_ack_sequence.wrapping_sub(**s);
+                    // Drop if it's too far behind (more than 32 sequence numbers)
+                    distance > REDUNDANT_PACKET_ACKS_SIZE
                 } else {
+                    // Packet is at or ahead of ACK sequence, still in flight, don't drop
                     false
                 }
             })
@@ -302,5 +308,105 @@ mod tests {
         // Update throttle (will check packet loss rate)
         let updated = handler.update_throttle(later);
         assert!(updated);
+    }
+
+    #[test]
+    fn test_dropped_packets_only_behind_ack() {
+        let mut handler = AcknowledgmentHandler::new();
+        let now = Instant::now();
+
+        // Send packets with sequences 0-9
+        for _ in 0..10 {
+            handler.process_outgoing(
+                PacketType::Packet,
+                b"test",
+                OrderingGuarantee::None,
+                None,
+                now,
+            );
+        }
+
+        // ACK sequence 5 (meaning 0-5 are acknowledged)
+        handler.process_incoming(0, 5, 0b111111, now);
+
+        // Sequences 6-9 should still be in flight (ahead of ACK)
+        let dropped = handler.dropped_packets();
+        assert_eq!(dropped.len(), 0, "Packets ahead of ACK should not be dropped");
+
+        // Now ACK sequence 50 (far ahead)
+        handler.process_incoming(0, 50, 0, now);
+
+        // Now sequences 6-9 should be dropped (more than 32 behind sequence 50)
+        let dropped = handler.dropped_packets();
+        assert_eq!(dropped.len(), 4, "Packets >32 behind ACK should be dropped");
+    }
+
+    #[test]
+    fn test_dropped_packets_wraparound() {
+        let mut handler = AcknowledgmentHandler::new();
+        let now = Instant::now();
+
+        // Set sequence to 65530 by sending that many packets
+        for _ in 0..65530 {
+            handler.process_outgoing(
+                PacketType::Packet,
+                b"x",
+                OrderingGuarantee::None,
+                None,
+                now,
+            );
+        }
+
+        // ACK and clear old packets to start fresh
+        handler.process_incoming(0, 65520, 0xFFFFFFFF, now);
+        handler.dropped_packets();
+
+        // Now send packets that will wrap around: 65530-65535, then 0-5 (12 packets total)
+        for _ in 0..12 {
+            handler.process_outgoing(
+                PacketType::Packet,
+                b"test",
+                OrderingGuarantee::None,
+                None,
+                now,
+            );
+        }
+
+        // ACK packet at sequence 5 (after wraparound)
+        // This acknowledges packets 65530-65535 and 0-5 (all 12 packets)
+        handler.process_incoming(0, 5, 0b111111, now);
+
+        // All packets should be ACKed and removed, nothing should be dropped
+        let dropped = handler.dropped_packets();
+        assert_eq!(dropped.len(), 0, "Packets within ACK window should not be dropped during wraparound");
+    }
+
+    #[test]
+    fn test_dropped_packets_window_edge() {
+        let mut handler = AcknowledgmentHandler::new();
+        let now = Instant::now();
+
+        // Send packet at sequence 0
+        handler.process_outgoing(
+            PacketType::Packet,
+            b"test",
+            OrderingGuarantee::None,
+            None,
+            now,
+        );
+
+        // ACK at sequence 32 (exactly at window edge)
+        handler.process_incoming(0, 32, 0, now);
+
+        // Packet 0 is exactly 32 behind, should NOT be dropped (boundary condition)
+        let dropped = handler.dropped_packets();
+        assert_eq!(dropped.len(), 0, "Packet exactly 32 behind should not be dropped");
+
+        // ACK at sequence 33
+        handler.process_incoming(0, 33, 0, now);
+
+        // Now packet 0 is 33 behind, should be dropped
+        let dropped = handler.dropped_packets();
+        assert_eq!(dropped.len(), 1, "Packet >32 behind should be dropped");
     }
 }

@@ -30,3 +30,6 @@ Thumbs.db
 
 # Environment
 .env
+
+# Claude AI files
+.claude/

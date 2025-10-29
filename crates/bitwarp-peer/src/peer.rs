@@ -88,11 +88,13 @@ struct CommandFragmentBuffer {
     ordered: bool,
     /// Fragments received so far (indexed by fragment_id)
     fragments: HashMap<u8, std::sync::Arc<[u8]>>,
+    /// Timestamp when first fragment was received (for timeout detection)
+    created_at: Instant,
 }
 
 impl CommandFragmentBuffer {
-    fn new(channel_id: u8, fragment_count: u8, ordered: bool) -> Self {
-        Self { channel_id, fragment_count, ordered, fragments: HashMap::new() }
+    fn new(channel_id: u8, fragment_count: u8, ordered: bool, created_at: Instant) -> Self {
+        Self { channel_id, fragment_count, ordered, fragments: HashMap::new(), created_at }
     }
 
     fn channel_id(&self) -> u8 {
@@ -501,7 +503,7 @@ impl Peer {
     }
 
     /// Returns current per-peer fragment size in bytes.
-    fn current_fragment_size(&self) -> u16 {
+    pub fn current_fragment_size(&self) -> u16 {
         self.peer_fragment_size
     }
 
@@ -784,6 +786,40 @@ impl Peer {
         }
     }
 
+    /// Cleans up stale fragment buffers that haven't been completed within the timeout period.
+    /// This prevents memory leaks from incomplete fragments (e.g., due to packet loss or malicious behavior).
+    ///
+    /// Call this periodically (e.g., once per second) to prevent accumulation of stale buffers.
+    /// Default timeout is 5 seconds after the first fragment is received.
+    pub fn cleanup_stale_fragments(&mut self, time: Instant) {
+        const FRAGMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        // Collect sequences of stale buffers
+        let stale_sequences: Vec<u16> = self
+            .command_fragments
+            .iter()
+            .filter_map(|(seq, buffer)| {
+                if time.duration_since(buffer.created_at) > FRAGMENT_TIMEOUT {
+                    Some(*seq)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Remove stale buffers and log
+        if !stale_sequences.is_empty() {
+            tracing::warn!(
+                "Cleaning up {} stale fragment buffer(s) that timed out after {:?}",
+                stale_sequences.len(),
+                FRAGMENT_TIMEOUT
+            );
+            for seq in stale_sequences {
+                self.command_fragments.remove(&seq);
+            }
+        }
+    }
+
     // ===== Command-based API =====
 
     /// Returns the size of data carried by a protocol command.
@@ -851,9 +887,45 @@ impl Peer {
     pub fn enqueue_reliable_data(&mut self, channel_id: u8, data: Arc<[u8]>, ordered: bool) -> u16 {
         let sequence = self.acknowledge_handler.local_sequence_num();
 
-        let frag_size = self.current_fragment_size() as usize;
-        if data.len() <= frag_size {
-            // No fragmentation needed
+        // Compute datagram cap and per-command payload budget so a single
+        // SendReliable or SendFragment fits within one UDP datagram when encoded.
+        let datagram_cap = std::cmp::min(
+            self.current_fragment_size() as usize,
+            self.config.receive_buffer_max_size,
+        );
+        // Overheads common to any datagram containing exactly one command
+        let compression_overhead = match self.config.compression {
+            bitwarp_core::config::CompressionAlgorithm::Lz4 => 5, // marker + original size
+            _ => 1, // marker only
+        };
+        let checksum_overhead = if self.config.use_checksums { 4 } else { 0 };
+        let per_packet_overhead = 1 /* command count */ + compression_overhead + checksum_overhead;
+
+        // Header sizes for commands (not including the 2-byte length prefix)
+        let send_reliable_header = 1 /* type */ + 1 /* channel */ + 2 /* sequence */
+            + 1 /* ordered flag */ + 2 /* payload len */; // = 7
+        let send_fragment_header = 1 /* type */ + 1 /* channel */ + 2 /* sequence */
+            + 1 /* ordered flag */ + 1 /* frag_id */ + 1 /* frag_count */ + 2 /* len */; // = 9
+
+        // Maximum payload that fits for non-fragmented reliable
+        let max_payload_reliable = datagram_cap
+            .saturating_sub(per_packet_overhead)
+            .saturating_sub(2 /* len prefix */)
+            .saturating_sub(send_reliable_header);
+
+        // Validate MTU is large enough for minimum payload
+        if max_payload_reliable < 1 {
+            tracing::error!(
+                "MTU too small: datagram_cap={}, overhead={}, can't fit minimum payload",
+                datagram_cap,
+                per_packet_overhead + 2 + send_reliable_header
+            );
+            // Send nothing but log the error
+            return sequence;
+        }
+
+        if data.len() <= max_payload_reliable {
+            // No fragmentation needed (fits as a single SendReliable)
             self.enqueue_command(ProtocolCommand::SendReliable {
                 channel_id,
                 sequence,
@@ -861,15 +933,43 @@ impl Peer {
                 data: SharedBytes::from_arc(data),
             });
         } else {
-            // Fragment the data
-            let fragment_size = frag_size;
-            let total_fragments = ((data.len() + fragment_size - 1) / fragment_size) as u8;
+            // Fragment the data; compute fragment payload budget so each fragment packet fits
+            let fragment_payload = datagram_cap
+                .saturating_sub(per_packet_overhead)
+                .saturating_sub(2 /* len prefix */)
+                .saturating_sub(send_fragment_header);
+
+            if fragment_payload < 1 {
+                tracing::error!(
+                    "MTU too small for fragmentation: datagram_cap={}, overhead={}, can't fit minimum fragment payload",
+                    datagram_cap,
+                    per_packet_overhead + 2 + send_fragment_header
+                );
+                return sequence;
+            }
+
+            // Check for integer overflow before casting to u8
+            let total_fragments_usize = (data.len() + fragment_payload - 1) / fragment_payload;
+            if total_fragments_usize > u8::MAX as usize {
+                tracing::warn!(
+                    "Payload {} bytes too large to fragment: would require {} fragments (max {}), dropping packet",
+                    data.len(),
+                    total_fragments_usize,
+                    u8::MAX
+                );
+                return sequence;
+            }
+            let total_fragments = total_fragments_usize as u8;
 
             if total_fragments > self.config.max_fragments {
-                // Too many fragments - just send first fragment
-                // In a real system, this should return an error
+                tracing::warn!(
+                    "Payload requires {} fragments but max allowed is {}, sending first fragment only",
+                    total_fragments,
+                    self.config.max_fragments
+                );
+                // Too many fragments - send the first fragment only (best-effort)
                 let base = SharedBytes::from_arc(data);
-                let fragment_data = base.slice(0, fragment_size.min(base.len()));
+                let fragment_data = base.slice(0, fragment_payload.min(base.len()));
                 self.enqueue_command(ProtocolCommand::SendFragment {
                     channel_id,
                     sequence,
@@ -881,12 +981,18 @@ impl Peer {
                 return sequence;
             }
 
+            tracing::trace!(
+                "Fragmenting {} byte payload into {} fragments ({} bytes each)",
+                data.len(),
+                total_fragments,
+                fragment_payload
+            );
+
             for fragment_id in 0..total_fragments {
-                let start = (fragment_id as usize) * fragment_size;
-                let end = ((fragment_id as usize + 1) * fragment_size).min(data.len());
+                let start = (fragment_id as usize) * fragment_payload;
+                let end = ((fragment_id as usize + 1) * fragment_payload).min(data.len());
                 let base = SharedBytes::from_arc(data.clone());
                 let fragment_data = base.slice(start, end - start);
-
                 self.enqueue_command(ProtocolCommand::SendFragment {
                     channel_id,
                     sequence,
@@ -908,22 +1014,83 @@ impl Peer {
         let sequence = self.next_unreliable_sequence;
         self.next_unreliable_sequence = self.next_unreliable_sequence.wrapping_add(1);
 
-        let frag_size = self.current_fragment_size() as usize;
-        if data.len() <= frag_size {
+        // Compute datagram cap and per-command payload budget so a single
+        // SendUnreliable or SendUnreliableFragment fits within one UDP datagram when encoded.
+        let datagram_cap = std::cmp::min(
+            self.current_fragment_size() as usize,
+            self.config.receive_buffer_max_size,
+        );
+        let compression_overhead = match self.config.compression {
+            bitwarp_core::config::CompressionAlgorithm::Lz4 => 5,
+            _ => 1,
+        };
+        let checksum_overhead = if self.config.use_checksums { 4 } else { 0 };
+        let per_packet_overhead = 1 /* command count */ + compression_overhead + checksum_overhead;
+
+        // Header sizes (without the 2-byte length prefix)
+        let send_unrel_header = 1 /* type */ + 1 /* channel */ + 2 /* payload len */; // = 4
+        let send_unrel_frag_header = 1 /* type */ + 1 /* channel */ + 2 /* sequence */
+            + 1 /* frag_id */ + 1 /* frag_count */ + 2 /* len */; // = 8
+
+        let max_payload_unreliable = datagram_cap
+            .saturating_sub(per_packet_overhead)
+            .saturating_sub(2 /* len prefix */)
+            .saturating_sub(send_unrel_header);
+
+        // Validate MTU is large enough for minimum payload
+        if max_payload_unreliable < 1 {
+            tracing::error!(
+                "MTU too small: datagram_cap={}, overhead={}, can't fit minimum unreliable payload",
+                datagram_cap,
+                per_packet_overhead + 2 + send_unrel_header
+            );
+            return sequence;
+        }
+
+        if data.len() <= max_payload_unreliable {
             // No fragmentation needed
             self.enqueue_command(ProtocolCommand::SendUnreliable {
                 channel_id,
                 data: SharedBytes::from_arc(data),
             });
         } else {
-            // Fragment the data
-            let fragment_size = frag_size;
-            let total_fragments = ((data.len() + fragment_size - 1) / fragment_size) as u8;
+            // Fragment the data so each fragment fits
+            let fragment_payload = datagram_cap
+                .saturating_sub(per_packet_overhead)
+                .saturating_sub(2 /* len prefix */)
+                .saturating_sub(send_unrel_frag_header);
+
+            if fragment_payload < 1 {
+                tracing::error!(
+                    "MTU too small for unreliable fragmentation: datagram_cap={}, overhead={}, can't fit minimum fragment payload",
+                    datagram_cap,
+                    per_packet_overhead + 2 + send_unrel_frag_header
+                );
+                return sequence;
+            }
+
+            // Check for integer overflow before casting to u8
+            let total_fragments_usize = (data.len() + fragment_payload - 1) / fragment_payload;
+            if total_fragments_usize > u8::MAX as usize {
+                tracing::warn!(
+                    "Unreliable payload {} bytes too large to fragment: would require {} fragments (max {}), dropping packet",
+                    data.len(),
+                    total_fragments_usize,
+                    u8::MAX
+                );
+                return sequence;
+            }
+            let total_fragments = total_fragments_usize as u8;
 
             if total_fragments > self.config.max_fragments {
-                // Too many fragments - just send first fragment
+                tracing::warn!(
+                    "Unreliable payload requires {} fragments but max allowed is {}, sending first fragment only",
+                    total_fragments,
+                    self.config.max_fragments
+                );
+                // Too many fragments - send first fragment only (best-effort)
                 let base = SharedBytes::from_arc(data);
-                let fragment_data = base.slice(0, fragment_size.min(base.len()));
+                let fragment_data = base.slice(0, fragment_payload.min(base.len()));
                 self.enqueue_command(ProtocolCommand::SendUnreliableFragment {
                     channel_id,
                     sequence,
@@ -934,9 +1101,16 @@ impl Peer {
                 return sequence;
             }
 
+            tracing::trace!(
+                "Fragmenting {} byte unreliable payload into {} fragments ({} bytes each)",
+                data.len(),
+                total_fragments,
+                fragment_payload
+            );
+
             for fragment_id in 0..total_fragments {
-                let start = (fragment_id as usize) * fragment_size;
-                let end = ((fragment_id as usize + 1) * fragment_size).min(data.len());
+                let start = (fragment_id as usize) * fragment_payload;
+                let end = ((fragment_id as usize + 1) * fragment_payload).min(data.len());
                 let base = SharedBytes::from_arc(data.clone());
                 let fragment_data = base.slice(start, end - start);
 
@@ -1008,6 +1182,124 @@ impl Peer {
         self.record_data_sent(final_data.len());
 
         Ok(final_data)
+    }
+
+    /// Encodes up to `max_size` bytes worth of queued commands into a single datagram.
+    ///
+    /// - Returns `Ok(None)` if there are no queued commands.
+    /// - Returns `Ok(Some(bytes))` where `bytes.len() <= max_size` when data was produced.
+    ///
+    /// This prevents producing UDP payloads larger than the configured receive buffer (and typical MTUs),
+    /// avoiding OS-level EMSGSIZE errors and IP fragmentation.
+    pub fn encode_queued_commands_bounded(
+        &mut self,
+        max_size: usize,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        if !self.has_queued_commands() {
+            return Ok(None);
+        }
+
+        // Worst-case overhead outside of command bytes:
+        // - 1 byte command count header
+        // - per-command 2-byte length prefix
+        // - compression marker/header (1 byte; LZ4 adds extra 4 bytes to store original size)
+        // - optional checksum (4 bytes)
+        let compression_overhead = match self.config.compression {
+            bitwarp_core::config::CompressionAlgorithm::Lz4 => 5, // 1 marker + 4 original size
+            _ => 1, // 1 marker for None/Zlib
+        };
+        let checksum_overhead = if self.config.use_checksums { 4 } else { 0 };
+        let static_overhead = 1 /* command count */ + compression_overhead + checksum_overhead;
+
+        // Select as many commands as will fit within max_size when encoded
+        let mut selected_count = 0usize;
+        let mut aggregated_len = 1; // start with command count byte
+
+        // Pre-encode commands individually to know precise sizes
+        let mut per_command_sizes: Vec<usize> = Vec::new();
+        for cmd in self.command_queue.iter() {
+            let encoded = bitwarp_protocol::command_codec::CommandEncoder::encode_command(cmd)?;
+            let cmd_total = 2 /* length prefix */ + encoded.len();
+
+            // Check if adding this command would exceed limit (including trailing overhead)
+            if static_overhead + aggregated_len + cmd_total > max_size {
+                break;
+            }
+
+            aggregated_len += cmd_total;
+            per_command_sizes.push(cmd_total);
+            selected_count += 1;
+        }
+
+        if selected_count == 0 {
+            // First command is too large to fit within max_size
+            // This can happen with very large data payloads or very small MTU
+            if let Some(first_cmd) = self.command_queue.iter().next() {
+                let encoded = bitwarp_protocol::command_codec::CommandEncoder::encode_command(first_cmd)?;
+                let cmd_size = 2 + encoded.len();
+                let total_with_overhead = static_overhead + 1 + cmd_size;
+
+                tracing::warn!(
+                    "Command too large for MTU: command type {:?}, encoded size {} bytes, total with overhead {} bytes, max allowed {} bytes. Command will remain queued.",
+                    first_cmd.command_type(),
+                    cmd_size,
+                    total_with_overhead,
+                    max_size
+                );
+            }
+            // Nothing selected within the budget; avoid emitting oversize datagrams.
+            return Ok(None);
+        }
+
+        // Drain exactly selected_count commands, requeue the rest to preserve order
+        let drained: Vec<_> = self.drain_commands().collect();
+        let mut packet = CommandPacket::new();
+        for cmd in drained.iter().take(selected_count) {
+            packet.add_command(cmd.clone());
+        }
+        for cmd in drained.into_iter().skip(selected_count) {
+            self.enqueue_command(cmd);
+        }
+
+        // Encode into pooled scratch buffer
+        let mut scratch = self.tx_pool.allocate();
+        scratch.clear();
+        bitwarp_protocol::command_codec::CommandEncoder::encode_packet_into(&mut scratch, &packet)?;
+
+        // Apply compression using pooled buffer
+        let compression_buffer = self.compression_pool.acquire();
+        let mut final_data = bitwarp_protocol::command_codec::CommandEncoder::compress_with_buffer(
+            &scratch,
+            self.config.compression,
+            self.config.compression_threshold,
+            compression_buffer,
+        )?;
+        self.tx_pool.deallocate(scratch);
+
+        // Record packet and bytes sent
+        self.record_packet_sent();
+
+        if self.config.use_checksums {
+            bitwarp_protocol::command_codec::CommandEncoder::append_checksum_in_place(&mut final_data);
+        }
+
+        // Track bytes sent (full encoded size after compression/checksum)
+        self.record_data_sent(final_data.len());
+
+        // Sanity guard: ensure we did not exceed max_size
+        if final_data.len() > max_size {
+            tracing::error!(
+                "Encoded packet exceeded max_size after compression: {} bytes > {} bytes max. Selected {} commands, pre-compression size was {} bytes. Commands will remain queued.",
+                final_data.len(),
+                max_size,
+                selected_count,
+                aggregated_len
+            );
+            // Avoid producing oversize datagrams; keep commands queued for next attempt
+            return Ok(None);
+        }
+
+        Ok(Some(final_data))
     }
 
     /// Decodes and processes an incoming command packet.
@@ -1240,7 +1532,7 @@ impl Peer {
 
                 // Get or create fragment buffer for this sequence
                 let buffer = self.command_fragments.entry(*sequence).or_insert_with(|| {
-                    CommandFragmentBuffer::new(*channel_id, *fragment_count, *ordered)
+                    CommandFragmentBuffer::new(*channel_id, *fragment_count, *ordered, time)
                 });
 
                 // Add this fragment
@@ -1356,7 +1648,7 @@ impl Peer {
                 // Process unreliable fragment and reassemble if complete (no ACK needed)
                 // Get or create fragment buffer for this sequence
                 let buffer = self.command_fragments.entry(*sequence).or_insert_with(|| {
-                    CommandFragmentBuffer::new(*channel_id, *fragment_count, false)
+                    CommandFragmentBuffer::new(*channel_id, *fragment_count, false, time)
                 });
 
                 // Add this fragment
@@ -1742,7 +2034,7 @@ mod tests {
         let large_data = vec![42u8; 3000];
 
         // Enqueue the data - should automatically fragment
-        let _sequence = peer.enqueue_reliable_data(0, large_data.clone().into(), true);
+        let _sequence = peer.enqueue_reliable_data(0, large_data.into(), true);
 
         // Should have multiple SendFragment commands queued
         assert!(peer.has_queued_commands());
@@ -1773,7 +2065,7 @@ mod tests {
             ordered: true,
             fragment_id: 0,
             fragment_count: 3,
-            data: fragment1.clone().into(),
+            data: fragment1.into(),
         };
 
         let cmd2 = ProtocolCommand::SendFragment {
@@ -1782,7 +2074,7 @@ mod tests {
             ordered: true,
             fragment_id: 1,
             fragment_count: 3,
-            data: fragment2.clone().into(),
+            data: fragment2.into(),
         };
 
         let cmd3 = ProtocolCommand::SendFragment {
@@ -1791,7 +2083,7 @@ mod tests {
             ordered: true,
             fragment_id: 2,
             fragment_count: 3,
-            data: fragment3.clone().into(),
+            data: fragment3.into(),
         };
 
         // Process first two fragments - should not produce a packet yet
@@ -2842,7 +3134,7 @@ mod tests {
         let large_data = vec![99u8; 3000];
 
         // Enqueue the data - should automatically fragment
-        let _sequence = peer.enqueue_unreliable_data(0, large_data.clone().into());
+        let _sequence = peer.enqueue_unreliable_data(0, large_data.into());
 
         // Should have multiple SendUnreliableFragment commands queued
         assert!(peer.has_queued_commands());
@@ -2872,7 +3164,7 @@ mod tests {
             sequence: 1,
             fragment_id: 0,
             fragment_count: 3,
-            data: fragment1.clone().into(),
+            data: fragment1.into(),
         };
 
         let cmd2 = ProtocolCommand::SendUnreliableFragment {
@@ -2880,7 +3172,7 @@ mod tests {
             sequence: 1,
             fragment_id: 1,
             fragment_count: 3,
-            data: fragment2.clone().into(),
+            data: fragment2.into(),
         };
 
         let cmd3 = ProtocolCommand::SendUnreliableFragment {
@@ -2888,7 +3180,7 @@ mod tests {
             sequence: 1,
             fragment_id: 2,
             fragment_count: 3,
-            data: fragment3.clone().into(),
+            data: fragment3.into(),
         };
 
         let time = Instant::now();
@@ -3268,8 +3560,27 @@ mod tests {
     }
 
     #[test]
-    fn test_pmtu_discovery_disabled_by_default() {
+    fn test_pmtu_discovery_enabled_by_default() {
         let config = Config::default();
+        assert!(config.use_pmtu_discovery);
+
+        let creation_time = Instant::now();
+        let mut peer = Peer::new(get_fake_addr(), &config, creation_time);
+        // Move peer to connected state via state transitions
+        peer.state = crate::peer_state::PeerState::Connected;
+
+        // Wait for the PMTU interval to elapse before checking for probes
+        let probe_time = creation_time + std::time::Duration::from_millis(config.pmtu_interval_ms as u64 + 100);
+
+        // Should generate probes when enabled and connected after interval
+        peer.handle_pmtu(probe_time);
+        assert!(peer.has_queued_commands()); // Should have queued a PMTUProbe command
+    }
+
+    #[test]
+    fn test_pmtu_discovery_can_be_disabled() {
+        let mut config = Config::default();
+        config.use_pmtu_discovery = false;
         assert!(!config.use_pmtu_discovery);
 
         let mut peer = Peer::new(get_fake_addr(), &config, Instant::now());
@@ -3296,5 +3607,100 @@ mod tests {
 
         // Should converge and use pmtu_low as fragment size
         assert_eq!(peer.current_fragment_size(), config.pmtu_min);
+    }
+
+    #[test]
+    fn test_stale_fragment_cleanup() {
+        let config = Config::default();
+        let start_time = Instant::now();
+        let mut peer = Peer::new(get_fake_addr(), &config, start_time);
+
+        // Create incomplete fragmented packet by sending only first fragment
+        let fragment1 = vec![1, 2, 3];
+        let cmd = ProtocolCommand::SendFragment {
+            channel_id: 0,
+            sequence: 100,
+            ordered: true,
+            fragment_id: 0,
+            fragment_count: 3, // Expecting 3 fragments total
+            data: fragment1.into(),
+        };
+
+        // Process the first fragment
+        let result = peer.process_command(&cmd, start_time).unwrap();
+        assert_eq!(result.into_iter().count(), 0); // No complete packet yet
+
+        // Verify fragment buffer was created
+        assert_eq!(peer.command_fragments.len(), 1);
+
+        // Cleanup immediately - should not remove anything (< 5 second timeout)
+        peer.cleanup_stale_fragments(start_time);
+        assert_eq!(peer.command_fragments.len(), 1, "Fragment buffer should still exist");
+
+        // Wait for timeout period (5 seconds)
+        let later = start_time + std::time::Duration::from_secs(6);
+        peer.cleanup_stale_fragments(later);
+
+        // Stale buffer should be cleaned up
+        assert_eq!(peer.command_fragments.len(), 0, "Stale fragment buffer should be cleaned up");
+    }
+
+    #[test]
+    fn test_complete_fragments_not_cleaned() {
+        let config = Config::default();
+        let start_time = Instant::now();
+        let mut peer = Peer::new(get_fake_addr(), &config, start_time);
+
+        // Send all 3 fragments to complete the packet
+        for frag_id in 0..3 {
+            let fragment_data = vec![frag_id, frag_id + 1, frag_id + 2];
+            let cmd = ProtocolCommand::SendFragment {
+                channel_id: 0,
+                sequence: 200,
+                ordered: false,
+                fragment_id: frag_id,
+                fragment_count: 3,
+                data: fragment_data.into(),
+            };
+            peer.process_command(&cmd, start_time).unwrap();
+        }
+
+        // Complete fragments should be removed automatically after reassembly
+        assert_eq!(peer.command_fragments.len(), 0, "Complete fragments should be removed");
+
+        // Cleanup should not affect anything
+        let later = start_time + std::time::Duration::from_secs(10);
+        peer.cleanup_stale_fragments(later);
+        assert_eq!(peer.command_fragments.len(), 0);
+    }
+
+    #[test]
+    fn test_multiple_stale_fragments_cleanup() {
+        let config = Config::default();
+        let start_time = Instant::now();
+        let mut peer = Peer::new(get_fake_addr(), &config, start_time);
+
+        // Create multiple incomplete fragment buffers
+        for seq in 0..5 {
+            let cmd = ProtocolCommand::SendFragment {
+                channel_id: 0,
+                sequence: seq,
+                ordered: true,
+                fragment_id: 0,
+                fragment_count: 2,
+                data: vec![seq as u8].into(),
+            };
+            peer.process_command(&cmd, start_time).unwrap();
+        }
+
+        // Should have 5 incomplete fragment buffers
+        assert_eq!(peer.command_fragments.len(), 5);
+
+        // Cleanup after timeout
+        let later = start_time + std::time::Duration::from_secs(6);
+        peer.cleanup_stale_fragments(later);
+
+        // All stale buffers should be cleaned up
+        assert_eq!(peer.command_fragments.len(), 0, "All stale fragment buffers should be cleaned up");
     }
 }

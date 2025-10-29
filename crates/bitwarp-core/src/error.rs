@@ -90,6 +90,10 @@ pub enum PacketErrorKind {
     ExceededMaxPacketSize,
     /// Only `PacketType::Packet` can be fragmented
     PacketCannotBeFragmented,
+    /// MTU is too small to accommodate packet headers and minimum payload
+    MtuTooSmall,
+    /// Packet payload too large to fragment with current MTU settings
+    PayloadTooLargeToFragment,
 }
 
 impl Display for PacketErrorKind {
@@ -100,6 +104,12 @@ impl Display for PacketErrorKind {
             }
             PacketErrorKind::PacketCannotBeFragmented => {
                 write!(fmt, "The packet type cannot be fragmented.")
+            }
+            PacketErrorKind::MtuTooSmall => {
+                write!(fmt, "MTU is too small to accommodate packet headers and minimum payload.")
+            }
+            PacketErrorKind::PayloadTooLargeToFragment => {
+                write!(fmt, "Payload too large to fragment with current MTU settings.")
             }
         }
     }

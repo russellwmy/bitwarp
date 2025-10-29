@@ -4,6 +4,12 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license = "MIT"
+description = "A modern, high-performance reliable UDP networking library inspired by ENet, built with Rust"
+keywords = ["networking", "udp", "enet", "reliable-udp", "game-networking"]
+categories = ["network-programming", "game-development", "asynchronous"]
+homepage.workspace = true
+repository.workspace = true
+readme = "../../README.md"
 
 [lib]
 doctest = false

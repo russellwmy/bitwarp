@@ -382,7 +382,7 @@ mod tests {
 
         // Broadcast a message to all connections
         let broadcast_data = vec![10, 20, 30];
-        let count = server.broadcast_reliable(0, broadcast_data.clone()).unwrap();
+        let count = server.broadcast_reliable(0, broadcast_data).unwrap();
 
         // Should have sent to all established connections
         assert_eq!(count, established_count);
