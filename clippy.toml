@@ -1,0 +1,39 @@
+# =============================
+#  Clippy Configuration
+#  for Industrial Practice
+# =============================
+#
+# Note: Lint levels (warn/allow/deny) are configured in Cargo.toml
+# under [workspace.lints.clippy], not here. This file only contains
+# threshold and behavior configuration options.
+
+# === Complexity Thresholds ===
+# Lower thresholds for maintainable production code
+cognitive-complexity-threshold = 15
+type-complexity-threshold = 250
+
+# === Function Length ===
+# Encourage shorter, more focused functions
+too-many-lines-threshold = 100
+
+# === Memory and Performance ===
+# Warn on large types that may hurt cache efficiency or stack usage
+enum-variant-size-threshold = 64
+large-error-threshold = 128
+vec-box-size-threshold = 4096
+array-size-threshold = 512000
+
+# === Code Quality and Readability ===
+# Encourage clear naming and reasonable parameter counts
+single-char-binding-names-threshold = 4
+max-fn-params-bools = 2
+max-struct-bools = 3
+
+# === API Design ===
+# Keep trait bounds and struct field counts manageable
+max-trait-bounds = 5
+struct-field-name-threshold = 15
+
+# === Toolchain ===
+# Minimum Supported Rust Version
+msrv = "1.90.0"

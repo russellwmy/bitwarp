@@ -485,7 +485,7 @@ mod tests {
         config.max_duplicate_peers = 3;
         config.blocking_mode = false;
 
-        let mut server = Host::bind_any_with_config(config).unwrap();
+        let server = Host::bind_any_with_config(config).unwrap();
 
         // Simulate addresses from same IP but different ports
         let ip = "127.0.0.1";
@@ -599,10 +599,6 @@ mod tests {
 
         fn received_count(&self) -> usize {
             *self.received.lock().unwrap()
-        }
-
-        fn sent_count(&self) -> usize {
-            *self.sent.lock().unwrap()
         }
     }
 

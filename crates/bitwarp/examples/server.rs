@@ -20,7 +20,7 @@ fn parse_bind_addr() -> Option<SocketAddr> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Basic config; tweak here if you want to demo features quickly
-    let mut config = Config::default();
+    let config = Config::default();
     // Uncomment to try features:
     // config.compression = CompressionAlgorithm::Lz4;
     // config.use_checksums = true;
