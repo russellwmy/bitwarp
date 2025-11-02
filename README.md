@@ -238,11 +238,22 @@ cargo fmt --check                   # Check formatting
 
 ## Contributing
 
-Contributions are welcome! Please ensure:
+**We code with AI.** All implementation is done through AI-assisted development to maintain consistency and quality.
 
-- All tests pass: `cargo test --all`
-- Code is formatted: `cargo fmt`
-- No clippy warnings: `cargo clippy --all-targets`
+### We Welcome
+
+- Bug reports with reproduction steps
+- Performance proposals with benchmarks
+- Feature requests with use cases
+- PRs for config files (`clippy.toml`, `.rustfmt.toml`, CI/CD, documentation)
+
+### We Don't Accept
+
+PRs that modify `.rs` files - all Rust code is implemented via our AI workflow.
+
+### How to Contribute
+
+File an issue → We implement → You get credited
 
 ## License
 
